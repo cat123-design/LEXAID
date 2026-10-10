@@ -21,12 +21,19 @@ app.use(["/api/pwa-users", "/api/sync-pwa-user"], (_req, res) => {
   res.status(404).json({ error: "Not found" });
 });
 
-// Basic security headers for API and frontend responses.
+// Security headers. Avoid exposing detailed configuration through public responses.
 app.use((_req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
+  if (process.env.NODE_ENV === "production") {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  if (_req.path.startsWith("/api/")) {
+    res.setHeader("Cache-Control", "no-store");
+  }
   next();
 });
 
@@ -37,21 +44,30 @@ const aiRequestWindows = new Map<string, { count: number; resetAt: number }>();
 function limitAiRequests(req: express.Request, res: express.Response, next: express.NextFunction) {
   const now = Date.now();
   const key = req.ip || req.socket.remoteAddress || "unknown";
-  let window = aiRequestWindows.get(key);
 
+  // Remove expired entries to prevent the in-memory limiter growing indefinitely.
+  for (const [ip, entry] of aiRequestWindows) {
+    if (entry.resetAt <= now) aiRequestWindows.delete(ip);
+  }
+
+  // Bound memory use if requests arrive from many distinct addresses.
+  if (!aiRequestWindows.has(key) && aiRequestWindows.size >= 10000) {
+    const oldestKey = aiRequestWindows.keys().next().value;
+    if (oldestKey) aiRequestWindows.delete(oldestKey);
+  }
+
+  let window = aiRequestWindows.get(key);
   if (!window || window.resetAt <= now) {
     window = { count: 0, resetAt: now + 15 * 60 * 1000 };
     aiRequestWindows.set(key, window);
   }
 
   if (window.count >= 30) {
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((window.resetAt - now) / 1000))));
     return res.status(429).json({ error: "Too many requests. Please try again later." });
   }
 
   window.count += 1;
-  for (const [ip, entry] of aiRequestWindows) {
-    if (entry.resetAt <= now) aiRequestWindows.delete(ip);
-  }
   next();
 }
 
@@ -153,20 +169,12 @@ async function generateWithGemini(
       }
     }
 
-    const isModelUnavailable =
-      err?.status === 404 ||
-      err?.message?.includes("404") ||
-      err?.message?.includes("NOT_FOUND") ||
-      err?.message?.includes("is no longer available");
-
-    if (isModelUnavailable || true) {
-      return await ai.models.generateContent({
-        model: FALLBACK_GEMINI_MODEL,
-        contents: options.contents,
-        config: baseConfig,
-      });
-    }
-    throw err;
+    // Retry once with the fallback model after a primary-model failure.
+    return await ai.models.generateContent({
+      model: FALLBACK_GEMINI_MODEL,
+      contents: options.contents,
+      config: baseConfig,
+    });
   }
 }
 
@@ -192,19 +200,13 @@ app.get("/api/health", (_req, res) => {
   const simplifierKey = Boolean(process.env.GEMINI_SIMPLIFIER_API_KEY || process.env.GEMINI_API_KEY);
   const assistantKey = Boolean(process.env.GEMINI_ASSISTANT_API_KEY || process.env.GEMINI_API_KEY);
 
+  // Keep the public health response intentionally minimal; never disclose which
+  // individual secrets or privileged keys are configured.
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
-    aiConfigured: Boolean(process.env.GEMINI_API_KEY),
-    simplifierAiConfigured: simplifierKey,
-    assistantAiConfigured: assistantKey,
-    features: {
-      documentSimplifierKey: Boolean(process.env.GEMINI_SIMPLIFIER_API_KEY),
-      legalAssistantKey: Boolean(process.env.GEMINI_ASSISTANT_API_KEY),
-      globalGeminiKey: Boolean(process.env.GEMINI_API_KEY),
-    },
+    aiConfigured: Boolean(simplifierKey || assistantKey),
     supabaseConfigured: Boolean(sb),
-    hasServiceRoleKey: Boolean(sb && sb.hasServiceRole),
   });
 });
 
