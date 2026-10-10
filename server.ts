@@ -14,6 +14,22 @@ const PORT = Number(process.env.PORT || 3000);
 app.use(express.json({ limit: "30mb" }));
 app.use(express.urlencoded({ extended: true, limit: "30mb" }));
 
+// Temporary public-deployment safeguard: these legacy endpoints expose or accept
+// user records without verifying the caller's identity. Keep them disabled until
+// proper authentication and authorization are implemented.
+app.use(["/api/pwa-users", "/api/sync-pwa-user"], (_req, res) => {
+  res.status(404).json({ error: "Not found" });
+});
+
+// Basic security headers for API and frontend responses.
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
+
 // Feature-specific GoogleGenAI clients cache
 const genAiClients: Record<string, GoogleGenAI | null> = {};
 
