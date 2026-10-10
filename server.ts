@@ -30,6 +30,31 @@ app.use((_req, res, next) => {
   next();
 });
 
+// Per-IP in-memory limit for AI endpoints to reduce accidental or abusive API spend.
+// This is a lightweight demo safeguard, not a substitute for a production rate limiter.
+app.set("trust proxy", 1);
+const aiRequestWindows = new Map<string, { count: number; resetAt: number }>();
+function limitAiRequests(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const now = Date.now();
+  const key = req.ip || req.socket.remoteAddress || "unknown";
+  let window = aiRequestWindows.get(key);
+
+  if (!window || window.resetAt <= now) {
+    window = { count: 0, resetAt: now + 15 * 60 * 1000 };
+    aiRequestWindows.set(key, window);
+  }
+
+  if (window.count >= 30) {
+    return res.status(429).json({ error: "Too many requests. Please try again later." });
+  }
+
+  window.count += 1;
+  for (const [ip, entry] of aiRequestWindows) {
+    if (entry.resetAt <= now) aiRequestWindows.delete(ip);
+  }
+  next();
+}
+
 // Feature-specific GoogleGenAI clients cache
 const genAiClients: Record<string, GoogleGenAI | null> = {};
 
@@ -317,7 +342,7 @@ app.get("/api/laws", (req, res) => {
 });
 
 // 3. Document Simplifier / Analysis Endpoint (Uses dedicated GEMINI_SIMPLIFIER_API_KEY with Search Grounding)
-app.post("/api/analyze-document", async (req, res) => {
+app.post("/api/analyze-document", limitAiRequests, async (req, res) => {
   try {
     const { fileName = "Document", fileContent = "", fileDataUrl = "", language = "en" } = req.body;
     const isUr = language === "ur";
@@ -743,7 +768,7 @@ Conform strictly to this JSON format:
 });
 
 // 4. Case Analyzer Endpoint (Uses dedicated GEMINI_ASSISTANT_API_KEY with Google Search Grounding)
-app.post("/api/analyze-case", async (req, res) => {
+app.post("/api/analyze-case", limitAiRequests, async (req, res) => {
   try {
     const { description = "", language = "en" } = req.body;
     const isUr = language === "ur";
@@ -1081,7 +1106,7 @@ Respond strictly with valid JSON only conforming to this structure:
 });
 
 // 5. Case Assessor Endpoint (Computes preliminary legal position with Urdu & English statutory reasons)
-app.post("/api/assess-case", async (req, res) => {
+app.post("/api/assess-case", limitAiRequests, async (req, res) => {
   try {
     const {
       category = "tenancy",
